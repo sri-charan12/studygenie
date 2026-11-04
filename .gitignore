@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+.pytest_cache/
+.streamlit/secrets.toml
+data/
+studygenie_auth.db
+*.log
+StudyGenie_Test_Report.xlsx
+.flip_backup/
