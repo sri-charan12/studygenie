@@ -1,0 +1,37 @@
+[project]
+name = "studygenie"
+version = "1.0.0"
+description = "Rule-based student study planner (Python, SQLite, Streamlit)"
+requires-python = ">=3.10"
+dependencies = ["streamlit>=1.40", "pandas", "altair", "openpyxl", "anthropic"]
+
+[project.optional-dependencies]
+dev = ["ruff", "black", "mypy", "pytest"]
+
+[project.scripts]
+studygenie = "studygenie:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+py-modules = ["studygenie", "sg_core", "sg_ai", "sg_auth", "studygenie_ui"]
+
+[tool.black]
+line-length = 110
+
+[tool.ruff]
+line-length = 110
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]
+ignore = ["E501"]
+
+[tool.mypy]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+filterwarnings = ["ignore::DeprecationWarning"]
