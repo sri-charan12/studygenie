@@ -30,6 +30,7 @@ def planner_db(tmp_path):
 
 
 @pytest.fixture
+<<<<<<< HEAD
 def fake_anthropic(monkeypatch):
     calls = []
 
@@ -38,15 +39,34 @@ def fake_anthropic(monkeypatch):
             calls.append(kwargs)
             content = [types.SimpleNamespace(type="text", text="  Study Maths first.  ")]
             return types.SimpleNamespace(content=content)
+=======
+def fake_gemini(monkeypatch):
+    calls = []
+
+    class Models:
+        def generate_content(self, **kwargs):
+            calls.append(kwargs)
+            return types.SimpleNamespace(text="  Study Maths first.  ")
+>>>>>>> 56917d7ad2e0548d676f020bd028ced300768960
 
     class Client:
         def __init__(self, api_key):
             calls.append({"api_key": api_key})
+<<<<<<< HEAD
             self.messages = Messages()
 
     anthropic = types.ModuleType("anthropic")
     anthropic.Anthropic = Client
     monkeypatch.setitem(sys.modules, "anthropic", anthropic)
+=======
+            self.models = Models()
+
+    google = types.ModuleType("google")
+    genai = types.SimpleNamespace(Client=Client)
+    google.genai = genai
+    monkeypatch.setitem(sys.modules, "google", google)
+    monkeypatch.setitem(sys.modules, "google.genai", genai)
+>>>>>>> 56917d7ad2e0548d676f020bd028ced300768960
     return calls
 
 
@@ -84,6 +104,7 @@ def test_a_missing_database_gives_a_clear_message(tmp_path):
     assert "no planner data" in sg_ai.build_context(tmp_path / "nothing.db")
 
 
+<<<<<<< HEAD
 def test_ask_sends_the_question_data_and_key_and_returns_the_answer(fake_anthropic, planner_db):
     answer = sg_ai.ask("What first?", [], sg_ai.build_context(planner_db), "test-key")
     assert answer == "Study Maths first."
@@ -100,6 +121,24 @@ def test_ask_keeps_only_the_last_few_messages_of_history(fake_anthropic):
     messages = fake_anthropic[1]["messages"]
     assert len(messages) == 9  # 8 history + the new question
     assert {message["role"] for message in messages} == {"user", "assistant"}
+=======
+def test_ask_sends_the_question_data_and_key_and_returns_the_answer(fake_gemini, planner_db):
+    answer = sg_ai.ask("What first?", [], sg_ai.build_context(planner_db), "test-key")
+    assert answer == "Study Maths first."
+    assert fake_gemini[0] == {"api_key": "test-key"}
+    sent = fake_gemini[1]
+    assert "Maths" in sent["config"]["system_instruction"]
+    assert sent["contents"][-1] == {"role": "user", "parts": [{"text": "What first?"}]}
+    assert sent["config"]["max_output_tokens"] <= 2000
+
+
+def test_ask_keeps_only_the_last_few_messages_of_history(fake_gemini):
+    history = [{"role": "user" if i % 2 == 0 else "assistant", "content": f"m{i}"} for i in range(20)]
+    sg_ai.ask("next?", history, "ctx", "k")
+    contents = fake_gemini[1]["contents"]
+    assert len(contents) == 9  # 8 history + the new question
+    assert {c["role"] for c in contents} == {"user", "model"}  # Gemini calls the assistant "model"
+>>>>>>> 56917d7ad2e0548d676f020bd028ced300768960
 
 
 def error(name, code=None, message=""):
