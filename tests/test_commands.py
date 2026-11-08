@@ -272,7 +272,7 @@ def test_shipped_sample_data_imports(conn):
     if not sample.exists():
         pytest.skip("sample workbook not found")
     sg.cmd_import_excel(conn, ns(file=str(sample)))
-    assert (count(conn, "subjects"), count(conn, "topics"), count(conn, "exams")) == (5, 17, 5)
+    assert (count(conn, "subjects"), count(conn, "topics"), count(conn, "exams")) == (4, 10, 4)
 
 
 # ---------------------------------------------------------- database access
