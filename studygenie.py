@@ -1,11 +1,9 @@
 #!/usr/bin/env python3
 
-import argparse
 import csv
 import json
 import os
 import sqlite3
-import sys
 from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import date, datetime, timedelta
@@ -17,13 +15,11 @@ from sg_core import (
     Item,
     NotFoundError,
     Planner,
-    StudyGenieError,
     Timer,
     ValidationError,
     clean_name,
     estimate_minutes,
     log,
-    setup_logging,
     summarize,
 )
 
@@ -81,43 +77,16 @@ def connect(path):
     conn.execute("PRAGMA foreign_keys = ON")
     conn.executescript(SCHEMA)
     conn.execute("INSERT OR IGNORE INTO settings VALUES ('daily_minutes', '180')")
+    conn.execute("INSERT OR IGNORE INTO settings VALUES ('catch_up_first', '1')")
     conn.commit()
     return conn
-
-
-def level(value):
-    v = int(value)
-    if not 1 <= v <= 5:
-        raise argparse.ArgumentTypeError("difficulty must be between 1 and 5")
-    return v
 
 
 def valid_date(value):
     try:
         return datetime.strptime(value, "%Y-%m-%d").date().isoformat()
     except ValueError:
-        raise argparse.ArgumentTypeError("date must be YYYY-MM-DD") from None
-
-
-def nonempty(value):
-    v = clean_name(value)
-    if not v:
-        raise argparse.ArgumentTypeError("name cannot be empty")
-    return v
-
-
-def hours_value(value):
-    v = float(value)
-    if not 0.5 <= v <= 16:
-        raise argparse.ArgumentTypeError("hours must be between 0.5 and 16")
-    return v
-
-
-def positive_int(value):
-    v = int(value)
-    if v < 1:
-        raise argparse.ArgumentTypeError("must be a positive number")
-    return v
+        raise ValidationError("date must be YYYY-MM-DD") from None
 
 
 def get_subject(conn, name):
@@ -132,21 +101,17 @@ def get_setting(conn, key):
     return conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()[0]
 
 
-def table(headers, rows):
-    if not rows:
-        print("(nothing to show)")
-        return
-    widths = [max(len(str(h)), *(len(str(r[i])) for r in rows)) for i, h in enumerate(headers)]
-    line = "  ".join(str(h).ljust(w) for h, w in zip(headers, widths, strict=True))
-    print(line)
-    print("  ".join("-" * w for w in widths))
-    for r in rows:
-        print("  ".join(str(c).ljust(w) for c, w in zip(r, widths, strict=True)))
+def get_setting_or(conn, key, default):
+    row = conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+    return row[0] if row else default
+
+
+def skipped_backlog(conn):
+    """[(subject, topic, minutes still owed)] for topics with skipped sessions not yet made up."""
+    return [(i.subject, i.name, i.overdue) for i in load_items(conn, date.today(), 14) if i.overdue > 0]
 
 
 # ---------------------------------------------------------------- commands
-def cmd_init(conn, args):
-    print(f"Database ready at: {args.db}")
 
 
 def require_name(value):
@@ -219,34 +184,6 @@ def cmd_set_hours(conn, args):
     print(f"Daily study time set to {args.hours} h ({minutes} min)")
 
 
-def cmd_list(conn, args):
-    if args.what == "subjects":
-        rows = conn.execute(
-            "SELECT s.id, s.name, s.difficulty, COUNT(t.id) FROM subjects s "
-            "LEFT JOIN topics t ON t.subject_id = s.id GROUP BY s.id ORDER BY s.name"
-        ).fetchall()
-        table(["ID", "SUBJECT", "DIFFICULTY", "TOPICS"], rows)
-    elif args.what == "topics":
-        rows = conn.execute(
-            "SELECT t.id, s.name, t.name, t.difficulty, t.est_minutes, t.status "
-            "FROM topics t JOIN subjects s ON s.id = t.subject_id ORDER BY s.name, t.id"
-        ).fetchall()
-        table(["ID", "SUBJECT", "TOPIC", "DIFF", "EST_MIN", "STATUS"], rows)
-    elif args.what == "exams":
-        rows = conn.execute(
-            "SELECT e.id, s.name, e.title, e.exam_date FROM exams e "
-            "JOIN subjects s ON s.id = e.subject_id ORDER BY e.exam_date"
-        ).fetchall()
-        table(["ID", "SUBJECT", "EXAM", "DATE"], rows)
-    else:
-        rows = conn.execute(
-            "SELECT x.id, x.session_date, s.name, t.name, x.minutes, x.status "
-            "FROM sessions x JOIN topics t ON t.id = x.topic_id "
-            "JOIN subjects s ON s.id = t.subject_id ORDER BY x.session_date, x.id"
-        ).fetchall()
-        table(["ID", "DATE", "SUBJECT", "TOPIC", "MIN", "STATUS"], rows)
-
-
 WEEKDAYS = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
 
 
@@ -265,7 +202,13 @@ def load_items(conn, today: date, days: int) -> list[Item]:
                (SELECT MIN(exam_date) FROM exams e
                  WHERE e.subject_id = s.id AND e.exam_date >= ?) AS exam_date,
                COALESCE((SELECT SUM(minutes) FROM sessions x
-                          WHERE x.topic_id = t.id AND x.status = 'completed'), 0) AS done_min
+                          WHERE x.topic_id = t.id AND x.status = 'completed'), 0) AS done_min,
+               COALESCE((SELECT SUM(minutes) FROM sessions x
+                          WHERE x.topic_id = t.id AND x.status = 'skipped'), 0) AS skipped_min,
+               COALESCE((SELECT SUM(minutes) FROM sessions x
+                          WHERE x.topic_id = t.id AND x.status = 'completed'
+                            AND x.session_date >= (SELECT MIN(session_date) FROM sessions y
+                                                    WHERE y.topic_id = t.id AND y.status = 'skipped')), 0) AS madeup_min
         FROM topics t JOIN subjects s ON s.id = t.subject_id
         WHERE t.status = 'pending'""",
         (today.isoformat(),),
@@ -289,6 +232,7 @@ def load_items(conn, today: date, days: int) -> list[Item]:
                 remaining,
                 (r["sdiff"] + r["tdiff"]) / 2,
                 min(last_day, horizon_end),
+                min(max(r["skipped_min"] - r["madeup_min"], 0), remaining),
             )
         )
     return items
@@ -300,7 +244,7 @@ def cmd_set_rest_days(conn, args):
     conn.commit()
     names = ", ".join(WEEKDAYS[d] for d in days) or "none"
     log.info("rest days set to %s", names)
-    print(f"Rest days set to: {names}. Run 'plan' to apply.")
+    print(f"Rest days set to: {names}. Generate the plan again to apply.")
 
 
 def get_topic(conn, subject, name):
@@ -343,7 +287,7 @@ def cmd_edit_topic(conn, args):
     )
     conn.commit()
     log.info("edited topic %s: difficulty %s", args.name, args.difficulty)
-    print(f"Topic '{args.name}' is now difficulty {args.difficulty} (~{est} min). Run 'plan' to apply.")
+    print(f"Topic '{args.name}' is now difficulty {args.difficulty} (~{est} min). Generate the plan again to apply.")
 
 
 def cmd_delete_exam(conn, args):
@@ -361,7 +305,7 @@ def cmd_edit_exam(conn, args):
     if cur.rowcount == 0:
         raise NotFoundError(f"exam {args.exam_id} not found")
     log.info("exam %s moved to %s", args.exam_id, args.date)
-    print(f"Exam {args.exam_id} moved to {args.date}. Run 'plan' to apply.")
+    print(f"Exam {args.exam_id} moved to {args.date}. Generate the plan again to apply.")
 
 
 def cmd_plan(conn, args):
@@ -380,14 +324,21 @@ def cmd_plan(conn, args):
     conn.execute("DELETE FROM sessions WHERE status = 'planned' AND session_date >= ?", (today.isoformat(),))
 
     items = load_items(conn, today, args.days)
+    catch_up = get_setting_or(conn, "catch_up_first", "1") == "1"
+    backlog = [i for i in items if i.overdue > 0]
+    if catch_up and backlog:
+        print("Catch-up first: you skipped these, so the plan finishes them before any new topic:")
+        for i in backlog:
+            print(f"  - {i.subject} / {i.name}: {i.overdue} min")
+        print()
 
     if not items:
         conn.commit()
-        print("No pending topics to plan. Add topics with: add-topic <subject> <n> [difficulty]")
+        print("No pending topics to plan. Add topics on the Add data tab.")
         return
 
     with Timer() as timer:
-        blocks = Planner(scorer).build(items, today, args.days, daily, rest)
+        blocks = Planner(scorer, catch_up=catch_up).build(items, today, args.days, daily, rest)
     conn.executemany(
         "INSERT INTO sessions (topic_id, session_date, minutes) VALUES (?,?,?)",
         [(b.topic_id, b.day.isoformat(), b.minutes) for b in blocks],
@@ -410,23 +361,8 @@ def cmd_plan(conn, args):
         print("\nWarning - not enough time for:")
         for i in unplanned:
             print(f"  - {i.subject} / {i.name}: {i.remaining} min left unscheduled")
-        print("Increase daily hours (set-hours) or plan more days.")
-    print("\nSee it with: today   or   list sessions")
-
-
-def cmd_today(conn, args):
-    d = date.today().isoformat()
-    rows = conn.execute(
-        "SELECT x.id, s.name, t.name, x.minutes, x.status FROM sessions x "
-        "JOIN topics t ON t.id = x.topic_id JOIN subjects s ON s.id = t.subject_id "
-        "WHERE x.session_date = ? ORDER BY x.id",
-        (d,),
-    ).fetchall()
-    print(f"Study plan for {d}")
-    table(["ID", "SUBJECT", "TOPIC", "MIN", "STATUS"], rows)
-    if rows:
-        print("\nMark finished with: done <ID> [minutes]")
-
+        print("Increase the daily hours or plan more days.")
+    
 
 def cmd_done(conn, args):
     s = conn.execute("SELECT * FROM sessions WHERE id = ?", (args.session_id,)).fetchone()
@@ -457,54 +393,7 @@ def cmd_skip(conn, args):
     if cur.rowcount == 0:
         raise NotFoundError(f"session {args.session_id} not found")
     log.info("session %s skipped", args.session_id)
-    print(f"Session {args.session_id} skipped. Run 'plan' again to reschedule.")
-
-
-def cmd_progress(conn, args):
-    rows = conn.execute("""
-        SELECT s.name,
-               COUNT(t.id) AS total,
-               SUM(t.status='done') AS done,
-               COALESCE((SELECT SUM(x.minutes) FROM sessions x JOIN topics tt ON tt.id=x.topic_id
-                          WHERE tt.subject_id=s.id AND x.status='completed'),0) AS mins
-        FROM subjects s LEFT JOIN topics t ON t.subject_id = s.id
-        GROUP BY s.id ORDER BY s.name""").fetchall()
-    out = []
-    for r in rows:
-        total, done = r["total"], r["done"] or 0
-        pct = int(100 * done / total) if total else 0
-        bar = "#" * (pct // 10) + "." * (10 - pct // 10)
-        out.append([r["name"], f"{done}/{total}", f"[{bar}] {pct}%", f"{r['mins']} min"])
-    table(["SUBJECT", "TOPICS", "PROGRESS", "STUDIED"], out)
-
-    exams = conn.execute(
-        "SELECT s.name, e.title, e.exam_date FROM exams e JOIN subjects s ON s.id=e.subject_id "
-        "WHERE e.exam_date >= ? ORDER BY e.exam_date",
-        (date.today().isoformat(),),
-    ).fetchall()
-    if exams:
-        print("\nUpcoming exams")
-        table(
-            ["SUBJECT", "EXAM", "DATE", "DAYS LEFT"],
-            [
-                [
-                    e["name"],
-                    e["title"],
-                    e["exam_date"],
-                    (date.fromisoformat(e["exam_date"]) - date.today()).days,
-                ]
-                for e in exams
-            ],
-        )
-
-
-def cmd_tables(conn, args):
-    rows = []
-    for t in ["subjects", "topics", "exams", "sessions", "settings"]:
-        n = conn.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
-        cols = ", ".join(c[1] for c in conn.execute(f"PRAGMA table_info({t})"))
-        rows.append([t, n, cols])
-    table(["TABLE", "ROWS", "COLUMNS"], rows)
+    print(f"Session {args.session_id} skipped. Generate the plan again: this topic will be finished before any new one starts.")
 
 
 def cmd_export_excel(conn, args):
@@ -624,175 +513,7 @@ def cmd_export(conn, args):
     print(f"Exported to {path}")
 
 
-def cmd_menu(conn, args):
-    """Interactive manual data entry. Every entry is committed immediately."""
-
-    class A:  # tiny args holder reused by the existing commands
-        pass
-
-    while True:
-        print("\n=== StudyGenie menu ===")
-        print("1 Add subject   2 Add topic   3 Add exam   4 Set daily hours")
-        print("5 Generate plan 6 Today       7 Mark done  8 Progress")
-        print("9 Show all tables             0 Exit")
-        ch = input("Choose: ").strip()
-        a = A()
-        try:
-            if ch == "1":
-                a.name = nonempty(input("Subject name: "))
-                a.difficulty = level(input("Difficulty 1-5: ") or 3)
-                cmd_add_subject(conn, a)
-            elif ch == "2":
-                a.subject = input("Subject name: ").strip()
-                a.name = nonempty(input("Topic name: "))
-                d = input("Difficulty 1-5 (Enter = subject's): ").strip()
-                a.difficulty = level(d) if d else None
-                cmd_add_topic(conn, a)
-            elif ch == "3":
-                a.subject = input("Subject name: ").strip()
-                a.title = nonempty(input("Exam title: "))
-                a.date = valid_date(input("Date YYYY-MM-DD: ").strip())
-                cmd_add_exam(conn, a)
-            elif ch == "4":
-                a.hours = hours_value(input("Hours per day: "))
-                cmd_set_hours(conn, a)
-            elif ch == "5":
-                a.days = positive_int(input("Days to plan (7): ") or 7)
-                cmd_plan(conn, a)
-            elif ch == "6":
-                cmd_today(conn, a)
-            elif ch == "7":
-                a.session_id = int(input("Session ID: "))
-                m = input("Minutes (Enter = planned): ").strip()
-                a.minutes = positive_int(m) if m else None
-                cmd_done(conn, a)
-            elif ch == "8":
-                cmd_progress(conn, a)
-            elif ch == "9":
-                for w in ["subjects", "topics", "exams", "sessions"]:
-                    print(f"\n[{w}]")
-                    a.what = w
-                    cmd_list(conn, a)
-            elif ch == "0":
-                break
-            else:
-                print("Invalid choice")
-        except StudyGenieError as e:
-            print(f"{error_label(e)}: {e}")
-        except (ValueError, argparse.ArgumentTypeError) as e:
-            print(f"Invalid input: {e}")
-
-
-def cmd_watch(conn, args):
-    """Live view: redraws all tables every few seconds. Run in a second terminal."""
-    import time
-
-    class A:
-        pass
-
-    try:
-        while True:
-            os.system("cls" if os.name == "nt" else "clear")
-            print(f"LIVE VIEW of {args.db}  (updated {datetime.now():%H:%M:%S}, Ctrl+C to stop)")
-            for w in ["subjects", "topics", "exams", "sessions"]:
-                print(f"\n[{w}]")
-                a = A()
-                a.what = w
-                cmd_list(conn, a)
-            time.sleep(args.seconds)
-    except KeyboardInterrupt:
-        print("\nStopped.")
-
-
 # ------------------------------------------------------------------- parser
-def build_parser():
-    p = argparse.ArgumentParser(
-        prog="studygenie", description="StudyGenie - rule-based student study planner"
-    )
-    p.add_argument("--db", default=DB_DEFAULT, help="SQLite file (default: studygenie.db)")
-    sub = p.add_subparsers(dest="command", required=True, metavar="command")
-
-    sub.add_parser("init", help="create the database and tables").set_defaults(func=cmd_init)
-
-    s = sub.add_parser("add-subject", help="add a subject")
-    s.add_argument("name", type=nonempty)
-    s.add_argument("difficulty", type=level, nargs="?", default=3, help="1-5 (default 3)")
-    s.set_defaults(func=cmd_add_subject)
-
-    s = sub.add_parser("add-topic", help="add a topic to a subject")
-    s.add_argument("subject")
-    s.add_argument("name", type=nonempty)
-    s.add_argument("difficulty", type=level, nargs="?", help="1-5 (default: subject's)")
-    s.set_defaults(func=cmd_add_topic)
-
-    s = sub.add_parser("add-exam", help="add an exam date")
-    s.add_argument("subject")
-    s.add_argument("title", type=nonempty)
-    s.add_argument("date", type=valid_date, help="YYYY-MM-DD")
-    s.set_defaults(func=cmd_add_exam)
-
-    s = sub.add_parser("set-hours", help="set daily study hours")
-    s.add_argument("hours", type=hours_value)
-    s.set_defaults(func=cmd_set_hours)
-
-    s = sub.add_parser("list", help="list subjects, topics, exams or sessions")
-    s.add_argument("what", choices=["subjects", "topics", "exams", "sessions"])
-    s.set_defaults(func=cmd_list)
-
-    s = sub.add_parser("plan", help="generate the rule-based study plan")
-    s.add_argument("days", type=positive_int, nargs="?", default=7, help="days to plan (default 7)")
-    s.add_argument("--scorer", choices=sorted(SCORERS), default="rule", help="scoring rule (default: rule)")
-    s.set_defaults(func=cmd_plan)
-
-    sub.add_parser("today", help="show today's sessions").set_defaults(func=cmd_today)
-
-    s = sub.add_parser("done", help="mark a session completed")
-    s.add_argument("session_id", type=int)
-    s.add_argument("minutes", type=positive_int, nargs="?", help="actual minutes studied")
-    s.set_defaults(func=cmd_done)
-
-    s = sub.add_parser("skip", help="skip a session")
-    s.add_argument("session_id", type=int)
-    s.set_defaults(func=cmd_skip)
-
-    s = sub.add_parser("import-excel", help="load subjects/topics/exams from an .xlsx file")
-    s.add_argument("file")
-    s.set_defaults(func=cmd_import_excel)
-    s = sub.add_parser("export-excel", help="save all tables to an .xlsx file")
-    s.add_argument("file")
-    s.set_defaults(func=cmd_export_excel)
-    s = sub.add_parser("export", help="save data as .json, .csv or .xlsx (chosen by file suffix)")
-    s.add_argument("file")
-    s.set_defaults(func=cmd_export)
-    s = sub.add_parser("set-rest-days", help="weekdays with no study, e.g. set-rest-days sun")
-    s.add_argument("days", nargs="+", choices=[*WEEKDAYS, "none"])
-    s.set_defaults(func=cmd_set_rest_days)
-    s = sub.add_parser("delete-subject", help="delete a subject with its topics, exams and sessions")
-    s.add_argument("name")
-    s.set_defaults(func=cmd_delete_subject)
-    s = sub.add_parser("delete-topic", help="delete a topic and its sessions")
-    s.add_argument("subject")
-    s.add_argument("name")
-    s.set_defaults(func=cmd_delete_topic)
-    s = sub.add_parser("edit-topic", help="change a topic's difficulty")
-    s.add_argument("subject")
-    s.add_argument("name")
-    s.add_argument("difficulty", type=level)
-    s.set_defaults(func=cmd_edit_topic)
-    s = sub.add_parser("delete-exam", help="delete an exam by id (see: list exams)")
-    s.add_argument("exam_id", type=int)
-    s.set_defaults(func=cmd_delete_exam)
-    s = sub.add_parser("edit-exam", help="move an exam to a new date")
-    s.add_argument("exam_id", type=int)
-    s.add_argument("date", type=valid_date, help="YYYY-MM-DD")
-    s.set_defaults(func=cmd_edit_exam)
-    sub.add_parser("progress", help="show progress and upcoming exams").set_defaults(func=cmd_progress)
-    sub.add_parser("tables", help="show tables, columns and row counts").set_defaults(func=cmd_tables)
-    sub.add_parser("menu", help="interactive manual data entry").set_defaults(func=cmd_menu)
-    s = sub.add_parser("watch", help="live auto-refreshing view of all tables")
-    s.add_argument("seconds", type=float, nargs="?", default=2, help="refresh interval (default 2)")
-    s.set_defaults(func=cmd_watch)
-    return p
 
 
 def error_label(exc: Exception) -> str:
@@ -810,18 +531,3 @@ def open_db(path: str) -> Iterator[sqlite3.Connection]:
         raise
     finally:
         conn.close()
-
-
-def main(argv=None):
-    args = build_parser().parse_args(argv)
-    setup_logging(Path(args.db).with_suffix(".log"))
-    try:
-        with open_db(args.db) as conn:
-            args.func(conn, args)
-    except StudyGenieError as exc:
-        print(f"{error_label(exc)}: {exc}", file=sys.stderr)
-        sys.exit(1)
-
-
-if __name__ == "__main__":
-    main()

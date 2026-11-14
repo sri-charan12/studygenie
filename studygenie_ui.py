@@ -97,6 +97,13 @@ def allow(*permissions):
     return USER is None or any(p in PERMS for p in permissions)
 
 
+# ------------------------------------------------------------ index (home) page
+# Lives in sg_home.py. Shows the cards first; the dashboard below runs after a card is opened.
+import sg_home
+
+sg_home.gate(st, USER, allow, AUTH_ON, AUTH_DB, sg_auth if AUTH_ON else None)
+
+
 # which permission each engine command needs (checked again in run(), so hiding a button is not the only guard)
 NEEDS = {
     "cmd_plan": "plan",
@@ -145,12 +152,10 @@ st.sidebar.caption("Rule-based planner: fixed formula, no AI. Same input gives t
 if allow("manage_users"):
     st.sidebar.markdown("**Watching this file**")
     st.sidebar.code(str(Path(DB).resolve()), language="text")
-    st.sidebar.caption("Adding data from a terminal? Use the same file:")
-    st.sidebar.code(f'python studygenie.py --db "{Path(DB).resolve()}" menu', language="bash")
 
 
 def fingerprint(path):
-    """Changes whenever any program (CLI, DB Browser, this UI) writes to the database file."""
+    """Changes whenever any program (DB Browser, this UI) writes to the database file."""
     try:
         info = Path(path).stat()
     except OSError:
@@ -232,7 +237,13 @@ TAB_DEFS = [  # key, label, shown when the role has any of these permissions (No
 shown = [(k, label) for k, label, need in TAB_DEFS if need is None or allow(*need)]
 if AUTH_ON and allow("manage_users"):
     shown.append(("users", "👑 Users"))
-T = dict(zip([k for k, _ in shown], st.tabs([label for _, label in shown]), strict=True))
+_labels = [label for _, label in shown]
+_open = st.session_state.pop("open_tab", None) if AUTH_ON else None
+try:  # newer Streamlit can open a chosen tab; older versions just open the first one
+    _tabs = st.tabs(_labels, default=_open) if _open in _labels else st.tabs(_labels)
+except TypeError:
+    _tabs = st.tabs(_labels)
+T = dict(zip([k for k, _ in shown], _tabs, strict=True))
 
 prog = q(
     """SELECT s.name AS subject, COUNT(t.id) AS topics, COALESCE(SUM(t.status='done'),0) AS done,
@@ -593,6 +604,26 @@ if "manage" in T:
 if "plan" in T:
     with T["plan"]:
         c1, c2 = st.columns([3, 2])
+        _conn = sg.connect(DB)
+        try:
+            owed = sg.skipped_backlog(_conn)
+            _on = sg.get_setting_or(_conn, "catch_up_first", "1") == "1"
+        finally:
+            _conn.close()
+        if owed:
+            st.warning(
+                "You skipped these topics:\n\n"
+                + "\n".join(f"- **{a}** / {b}: {m} min still to do" for a, b, m in owed)
+                + ("\n\nThe plan will finish them **before starting any new topic**." if _on else
+                   "\n\nCatch-up is switched off, so new topics may be planned first.")
+            )
+        _want = st.toggle("Finish skipped topics before starting new ones", value=_on, key="catch_up_toggle")
+        if _want != _on:
+            _conn = sg.connect(DB)
+            _conn.execute("INSERT OR REPLACE INTO settings VALUES ('catch_up_first', ?)", ("1" if _want else "0",))
+            _conn.commit()
+            _conn.close()
+            st.rerun()
         days = c1.slider("Days to plan", 1, 30, 14)
         rule = c2.radio(
             "Scoring rule", list(SCORERS), horizontal=True, help="Same Planner, different Scorer class"

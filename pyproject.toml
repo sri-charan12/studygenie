@@ -16,7 +16,7 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
-py-modules = ["studygenie", "sg_core", "sg_ai", "sg_auth", "studygenie_ui"]
+py-modules = ["studygenie", "sg_core", "sg_ai", "sg_auth", "sg_landing", "studygenie_ui"]
 
 [tool.black]
 line-length = 110

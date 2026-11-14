@@ -130,6 +130,7 @@ class Item:
     remaining: int
     weight: float
     last_day: date
+    overdue: int = 0  # minutes skipped earlier and not made up yet (catch-up debt)
 
     @property
     def need(self) -> float:
@@ -209,8 +210,9 @@ SCORERS: dict[str, type[Scorer]] = {
 class Planner:
     """Greedy scheduler. It has-a Scorer (composition), so rules can be swapped."""
 
-    def __init__(self, scorer: Scorer, block_minutes: int = BLOCK_MINUTES) -> None:
+    def __init__(self, scorer: Scorer, block_minutes: int = BLOCK_MINUTES, catch_up: bool = True) -> None:
         self.scorer = scorer
+        self.catch_up = catch_up  # True: skipped topics must be finished before any new topic starts
         self.block_minutes = block_minutes  # goes through the property setter
 
     @property
@@ -245,12 +247,16 @@ class Planner:
                 cands = [i for i in items if i.remaining > 0 and day <= i.last_day]
                 if not cands:
                     break
+                backlog = [i for i in cands if i.overdue > 0]
+                if self.catch_up and backlog:
+                    cands = backlog  # finish skipped topics first; the scorer only orders them
                 best = max(cands, key=key)
                 got = take(min(self.block_minutes, best.remaining))
                 if got == 0:
                     break
                 alloc[best.id] += got
                 best.remaining -= got
+                best.overdue = max(best.overdue - got, 0)
             blocks.extend(
                 Block(day, tid, by_id[tid].name, by_id[tid].subject, mins) for tid, mins in alloc.items()
             )
